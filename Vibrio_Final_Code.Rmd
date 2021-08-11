@@ -1,0 +1,2053 @@
+---
+title: "Math 539 Vibrio Project"
+output: pdf_document
+---
+
+# Vibrio Project
+
+### LOADING PACKAGES ###
+```{r message=FALSE, warning=FALSE}
+library(kableExtra) # rmarkdown tables
+library(tidyverse) # loads readr, dplyr, ggplot2 and other useful packages
+library(lubridate) # ymd_hm(), with_tz ()
+library(ggpubr) # ggarrange function
+library(RColorBrewer)
+library(sf) # simple features
+library(ggspatial)
+library(reshape2)
+library(metR)
+library(akima)
+library(ggfortify) # for diagnostic plots
+library(rpart) # trees
+library(rpart.plot) # trees visuals
+library(e1071) # tune.randomForest
+library(randomForest) # for random forest
+library(mi) # impute missing values
+library(caret) # confusionMatrix()
+library(class) # knn()
+library(splines) # cubic splines model 
+library(calendR) # creat calendars 
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(gtools)
+library(ggpubr)
+
+source("https://gist.githubusercontent.com/benmarwick/2a1bb0133ff568cbe28d/raw/fb53bd97121f7f9ce947837ef1a4c65a73bffb3f/geom_flat_violin.R")
+```
+
+### MODIFYING AND CLEANING DATA ###
+```{r warning=FALSE}
+vibrio <- read.csv(file = "vibrio8.csv", header = TRUE, na.strings = "") # new data as of 3/29/21
+
+# Data Cleaning
+
+
+# change specific variables to numeric
+vibrio[names(vibrio)[c(9:11,16:23,27:32)]] <- lapply(vibrio[names(vibrio)[c(9:11,16:23,27:32)]], as.numeric)
+
+# sea water temperature has 0, 170.62730, and salinity has -0.0019, change to NA
+vibrio$sea_water_temperature[568] <- NA
+vibrio$sea_water_temperature[550] <- NA
+vibrio$sea_water_practical_salinity[550] <- NA
+
+# Detection level is wrongly inputted as 3 for two Morro Bay observations, per 3/29/21 email
+vibrio$Detection.limit[c(20:21)] <- 0.3
+
+# Drakes Estero has 3 observations with detection limit 30, change to 3 and Vp level 3, per 3/29/21 email
+vibrio$Detection.limit[c(711:713)] <- 3
+vibrio$Vp_MPN_g[c(711:713)] <- 3
+
+# create new variable, "Vp_MPN_g_new", if 3 and < then 1.5, if 0.3 and < then 0.15
+vibrio <- vibrio %>%
+            mutate(Vp_MPN_g_new = ifelse(vibrio$Vp_MPN_g == 3 & vibrio$Vp..Mod. == "<", 1.5, vibrio$Vp_MPN_g)) %>%
+            relocate(Vp_MPN_g_new, .after = Vp_MPN_g)
+vibrio$Vp_MPN_g_new <- ifelse(vibrio$Vp_MPN_g == 0.3 & vibrio$Vp..Mod. == "<", 0.15, vibrio$Vp_MPN_g_new)
+
+# change "Vp_Detect" for qualitative test observations, observation 708 is "1"
+vibrio$Vp_Detect <- ifelse(is.na(vibrio$Vp_Detect), 0, vibrio$Vp_Detect)
+vibrio$Vp_Detect[708] <- 1
+
+# change specific variables to characters
+vibrio$Vp_Detect <- as.character(vibrio$Vp_Detect)
+vibrio$Detection.limit <- as.character(vibrio$Detection.limit)
+vibrio$Month <- as.character(vibrio$Month)
+
+# add log variable
+
+set.seed(2021)
+noise <- rnorm(715,0,0.04) # add random noise for variability
+vibrio <- vibrio %>% 
+            mutate(Vp_MPN_g_log = noise + log(vibrio$Vp_MPN_g_new)) %>%
+            relocate(Vp_MPN_g_log, .after = Vp_MPN_g_new)
+
+# fill trh, tdh column
+vibrio$trh <- ifelse(vibrio$trh == "NA", "-", vibrio$trh)
+vibrio$tdh <- ifelse(vibrio$tdh == "NA", "-", vibrio$tdh)
+
+# create gene variable
+vibrio <- vibrio %>% 
+            mutate(gene = ifelse(trh == "+" & tdh == "+", "Both", "Neither")) %>%
+            relocate(gene, .after = trh)
+vibrio$gene <- ifelse(vibrio$trh == "+" & vibrio$tdh == "-", "trh only", vibrio$gene)
+vibrio$gene <- ifelse(vibrio$trh == "-" & vibrio$tdh == "+", "tdh only", vibrio$gene)
+
+# create gene2 variable
+vibrio <- vibrio %>% 
+            mutate(gene2 = ifelse(gene == "Neither", "No", "Yes"))
+
+# create 3 category detection variable
+vibrio <- vibrio %>%
+            mutate(Vp_Detect_multi = "<= 3") %>%
+            relocate(Vp_Detect_multi, .after = Vp_Detect)
+vibrio$Vp_Detect_multi <- if_else(vibrio$Vp_MPN_g > 3 & vibrio$Vp_MPN_g <= 50,
+                                 "3-50", vibrio$Vp_Detect_multi)
+vibrio$Vp_Detect_multi <- if_else(vibrio$Vp_MPN_g > 50,
+                                 "> 50", vibrio$Vp_Detect_multi)
+
+# create over/under 5
+vibrio <- vibrio %>%
+            mutate(Vp_5 = ifelse(Vp_MPN_g < 5, "<5", ">=5")) %>%
+            relocate(Vp_5, .after = Vp_Detect_multi)
+
+# remove the false positive observations (723, 724, 725)
+# remove observations that have large trh concentration for low Vp concentration (343, 399, 586)
+# remove Tomales Bay observations with "0" on environmental variables (413, 414, 415, 478)
+vibrio <- vibrio[-c(723,724,725,343,399,586,413,414,415,478),]
+
+# Added a variable day and modified the format of Data 
+vibrio <- mutate(vibrio, day = yday(vibrio$Date))
+vibrio$Date = as.Date(vibrio$Date)
+
+# Wanted to add random noise to the variable 
+# Vp_MPN_g_new and then take the log of this New variable
+# that we will call New.Response
+set.seed(2021)
+noise = rnorm(715,0,0.04)
+new = noise + vibrio$Vp_MPN_g_new
+
+New = ifelse((new < 3 & vibrio$Vp_Detect == 1 & vibrio$Detection.limit == 3) 
+            | (new < .3 & vibrio$Vp_Detect == 1 & vibrio$Detection.limit == .3)
+                 , -noise + vibrio$Vp_MPN_g_new , new)
+
+vibrio = mutate(vibrio, New.Response = log(New))
+
+# created new variable where seasons are separated into 2
+# winter-spring and summer-fall
+vibrio <- mutate(vibrio, "Season.2" =  
+          ifelse(vibrio$Season == "Summer" | vibrio$Season == "Fall","summer-fall" ,"winter-spring"))
+
+# created a subset of agua hedionda and other sites
+df.agua = vibrio %>%
+               filter(Site == "Agua Hedionda")
+df.other = vibrio %>%
+               filter(Site != "Agua Hedionda")
+
+# created new variable that is either 1 or 0. It is 1 when the corresponding gene
+# is detected
+vibrio <- mutate(vibrio, trh_detect=ifelse(trh == "+",1,0))
+vibrio <- mutate(vibrio, tdh_detect=ifelse(tdh == "+",1,0))
+
+# looking at just the observations that had vp being detected
+vp.detected = vibrio%>%filter(Vp_Detect =="1")
+```
+
+### GOAL 1 MODELING ###
+
+#Dataframe used for mean inference
+```{r}
+#basically filters out observations where the concentration is not recorded.
+#mainly applies to those that were qualitative tests
+vibrio.mean <- vibrio[-which(is.na(vibrio$Vp_MPN_g)),]
+```
+
+#Visuals
+```{r}
+#Overall distribution of Vp
+hist.vp <- ggplot(vibrio.mean) +
+ aes(x = Vp_MPN_g) +
+ geom_histogram(bins = 20L, fill = "#ff0000", col = I("black")) +
+ labs(y = "Frequency", title = "Distribution of Vp Concentration", x = "Vp (MPN/g)") +
+ theme_gray()
+
+hist.vp.zoom <- ggplot(vibrio.mean) +
+ aes(x = Vp_MPN_g) +
+ geom_histogram(bins = 20L, fill = "#ff0000", col = I("black")) +
+ labs(y = "Frequency", title = "Distribution of Vp Concentration (Below 50)", x = "Vp (MPN/g)") +
+ theme_gray() + xlim(-2,50)
+
+ggarrange(hist.vp, hist.vp.zoom, nrow = 1, ncol = 2)
+
+#Distribution of Vp by site
+box.site <- ggplot(vibrio.mean) +
+ aes(x = Site, y = Vp_MPN_g, color = Site) +
+ geom_boxplot() +
+ labs(x = "Site", y = "Vp (MPN/g)", title = "Vp Concentration by Site") +
+ theme_gray() + theme(legend.position = "none", axis.text.x = element_text(size = 5))
+
+box.site.zoom <- ggplot(vibrio.mean) +
+ aes(x = Site, y = Vp_MPN_g, color = Site) +
+ geom_boxplot() +
+ labs(x = "Site", y = "Vp (MPN/g)", title = "Vp Concentration by Site (Below 30)") +
+ theme_gray() + coord_cartesian(ylim=c(0,30)) + 
+  theme(legend.position = "none", axis.text.x = element_text(size = 5))
+
+ggarrange(box.site, box.site.zoom, nrow = 1, ncol = 2)
+
+#Distribution of log-scale Vp
+hist.vp.log <- ggplot(vibrio.mean) +
+  aes(x = New.Response) +
+  geom_histogram(bins = 20L, fill = "#ff0000", col = I("black")) +
+  labs(y = "Frequency", title = "Distribution log of Vp Concentration", x = "log of Vp Concentration") +
+  theme_gray()
+ 
+a <- ggplot(vibrio.mean) +
+  aes(x = Site, y = New.Response, color = Site) +
+  geom_boxplot() +
+  labs(x = "Site", y = "log of Vp Concentration", title = "Log-scale Level by Site") +
+  theme_gray() + theme(legend.position = "none", axis.text.x = element_text(size = 5))
+ 
+ggarrange(hist.vp.log, a, nrow = 1, ncol = 2)
+
+#observed detection rates of vp and its genes
+#gene detection is conditioned on the fact that vp has been detected first
+vibrio$Vp_Detect <- as.factor(vibrio$Vp_Detect)
+levels(vibrio$Vp_Detect) <- c("-","+")
+
+a1 <- ggplot(vibrio) +
+ aes(x = Site, fill = Vp_Detect) +
+ geom_bar(position = "fill") +
+ scale_fill_hue() +
+ labs(x = "Site", y = "Relative Frequency", title = "Vp Detects by Site") +
+ theme_gray() + theme( axis.text.x = element_text(size = 5))
+
+a2 <- ggplot(vp.detected) +
+ aes(x = Site, fill = tdh) +
+ geom_bar(position = "fill") +
+ scale_fill_hue() +
+ labs(x = "Site", y = "Relative Frequency", title = "tdh Detects by Site", subtitle = "(Conditional on Vp Detection)") +
+ theme_gray() + theme( axis.text.x = element_text(size = 5))
+
+a3 <- ggplot(vp.detected) +
+ aes(x = Site, fill = trh) +
+ geom_bar(position = "fill") +
+ scale_fill_hue() +
+ labs(x = "Site", y = "Relative Frequency", title = "trh Detects by Site", subtitle = "(Conditional on Vp Detection)") +
+ theme_gray() + theme( axis.text.x = element_text(size = 5))
+
+ggarrange(a1,a2,a3, nrow = 2, ncol =2 )
+```
+
+#Kruskal Wallis Test
+```{r}
+#result suggests that there is at least one site that is different
+#in vp concentration, as well as there is at least one site that is
+#different in log scale vp concentration
+kruskal.test(formula = Vp_MPN_g ~ Site, data = vibrio.mean)
+kruskal.test(formula = Vp_MPN_g_log ~ Site, data = vibrio.mean)
+```
+
+#Pairwise Permutation Test
+```{r}
+#All the pairwise combinations for site. There are 10 of them
+#the loop below is going to go through pairs of sites, from this variable
+site.combo <- combinations(5, 2, v = levels(as.factor(vibrio$Site)))
+```
+
+```{r}
+#Vectors to store observed difference in mean and the p-value
+#as for the naming scheme, any variable with ".log" has to do
+#with the log scale of vp concentration
+p.val <- p.val.log <-  numeric(nrow(site.combo))
+obs.diff.mean <- obs.diff.mean.log <- numeric(nrow(site.combo))
+diff.mean <- diff.mean.log <-  matrix(0, nrow = 10000, ncol = 10) #store simulated difference of means here
+
+set.seed(1)
+
+for (i in 1:nrow(site.combo)){
+  #identify the pairs
+  #site.combo is a matrix where each row is a possible combination of sites
+  a <- site.combo[i,1]
+  b <- site.combo[i,2]
+  
+  #take subset of vp by the site 
+  vp.a <- vibrio.mean$Vp_MPN_g[which(vibrio.mean$Site == a)]
+  vp.b <- vibrio.mean$Vp_MPN_g[which(vibrio.mean$Site == b)]
+  vp.c <- vibrio.mean$Vp_MPN_g[which(vibrio.mean$Site == a | vibrio.mean$Site == b)] #this is the previous two combined
+  
+  vp.a.log <- vibrio.mean$New.Response[which(vibrio.mean$Site == a)]
+  vp.b.log <- vibrio.mean$New.Response[which(vibrio.mean$Site == b)]
+  vp.c.log <- vibrio.mean$New.Response[which(vibrio.mean$Site == a | vibrio.mean$Site == b)]
+  
+  #sample size in each site
+  n1 <- length(vp.a)
+  n2 <- length(vp.b)
+  n.total <- length(vp.c) #you can think of this as n1 + n2
+  
+  #Observed difference in means
+  
+  obs.diff.mean[i] <- mean(vp.a) - mean(vp.b)
+  obs.diff.mean.log[i] <- mean(vp.a.log) - mean(vp.b.log)
+   
+  for(j in 1:10000){
+    #sample which ones will belong to sample1, the rest go to sample 2
+    index <- sample(1:n.total, size = n1, replace = FALSE)
+    
+    sample1 <- vp.c[index]
+    sample2 <- vp.c[-index]
+    
+    sample1.log <- vp.c.log[index]
+    sample2.log <- vp.c.log[-index]
+    
+    #compute and store the simulated difference in means
+    diff.mean[j, i] <- mean(sample1) - mean(sample2)
+    diff.mean.log[j,i] <- mean(sample1.log) - mean(sample2.log)
+    
+  }
+  #doing a two sided test
+  p.val[i] <- sum(diff.mean[, i] > abs(obs.diff.mean[i]) | diff.mean[,i] < -abs(obs.diff.mean[i]))/10000
+  p.val.log[i] <- sum(diff.mean.log[, i] > abs(obs.diff.mean.log[i]) | diff.mean.log[,i] < -abs(obs.diff.mean.log[i]))/10000
+}
+```
+
+```{r}
+#resulting dataframes from pairwise permutation test. 
+#first dataset results from vp concentration
+#second dataset results from log scale vp concentration
+perm.test <- as.data.frame(cbind(site.combo, obs.diff.mean, p.val))
+
+perm.test.log <- as.data.frame(cbind(site.combo, obs.diff.mean.log, p.val.log))
+```
+
+```{r}
+#benjamini hochberg method for controlling false discovery rate.
+#we order the rows of the dataset by p.value (least to greatest)
+ben.hoch <- (1:10)*0.05/10
+
+cbind(perm.test[order(perm.test$p.val),], ben.hoch)
+cbind(perm.test.log[order(perm.test.log$p.val),], ben.hoch)
+
+#The last time that the p.value is below the benjamini threshold,
+#we reject the null hypothesis from the pair corresponding to the lowest p.value
+#up that last time.
+```
+
+```{r}
+perm.vp <- ggplot() + geom_point(aes(x= 1:10, y = sort(perm.test$p.val)), size = 3) +
+  geom_line(aes(x = 0:11, y = 0.005*(0:11), color = "BH"), size = 1)  +
+  scale_color_manual(name = "Colors", values = c("BH" = "purple")) +
+  labs(x = "k", y = "p-value", title = "BH Method for Vp") +
+  theme_gray()
+
+perm.vp.log <- ggplot() + geom_point(aes(x= 1:10, y = sort(perm.test.log$p.val)), size = 3) +
+  geom_line(aes(x = 0:11, y = 0.005*(0:11), color = "BH"), size = 1)  +
+  scale_color_manual(name = "Colors", values = c("BH" = "purple")) +
+  labs(x = "k", y = "p-value", title = "BH Method for log-scale Vp") +
+  theme_gray()
+
+ggarrange(perm.vp, perm.vp.log)
+```
+
+#TEST OF INDEPENDENCE for Vp detection
+```{r}
+#twct = two way contingency table
+#This chunk obtains the two way contingency table between site and vp detection, along with total row and column
+twct <- as.matrix(table(vibrio$Site, vibrio$Vp_Detect))
+twct <- cbind(twct, 0)
+twct <- rbind(twct, 0)
+
+for (i in 1:ncol(twct)){
+  twct[6,i] <- sum(twct[c(1,2,3,4,5), i])
+}
+
+for (i in 1:nrow(twct)){
+  twct[i,3] <- sum(twct[i, c(1,2)])
+}
+
+rownames(twct)[6] <- "Total"
+colnames(twct) <- c("Non-Detect", "Detect", "Total")
+
+twct
+```
+
+```{r}
+#This is the expected count matrix for the above two way table
+exp.count <- matrix(0, nrow = 5, ncol = 2)
+
+for (i in 1:5){
+  for (j in 1:2){
+    exp.count[i,j] <- twct[i,3]*twct[6,j]/twct[6,3]
+  }
+}
+```
+
+```{r}
+#A function to compute the chi-square statistic given the data and expected count matrix
+chi2.stat <- function(input.matrix, expected.matrix){
+  #dimensions of the matrices need to be the same.
+  a <- dim(input.matrix)
+  
+  contribution <- input.matrix - expected.matrix
+  contribution <- contribution^2
+  contribution <- contribution/expected.matrix
+  
+  return(sum(contribution))
+  
+}
+```
+
+```{r}
+#Simulate 10,000 chi-square statistics
+B <- 10000
+chi2 <- numeric(B)
+
+for (n in 1:B){
+  #Need to shuffle the observations
+  simul <- vibrio[, c(5,13)]
+  
+  simul$Vp_Detect <- sample(simul$Vp_Detect, size = nrow(simul), replace = FALSE)
+  
+  simul.table <- table(simul$Site, simul$Vp_Detect)
+  
+  chi2[n] <- chi2.stat(simul.table, exp.count)
+}
+
+```
+
+```{r}
+#Compare the simulated values with the observed
+
+#we can see that the observed does not make sense if the null hypothesis
+#that the detection rates between the sites are equal.
+obs.chi.sq <- chi2.stat(twct[1:5, 1:2], exp.count)
+
+chi2 <- as.data.frame(chi2) #this is so that it could be used with the ggplot builder
+
+ggplot(chi2) +
+ aes(x = chi2) +
+ geom_histogram(bins = 40L, fill = "#ff0000", col = I("black")) +
+ labs(y = "Frequency", title = "Null Distribution of Chi-Square Statistic", x = "Simulated Values") +
+ theme_gray() + coord_cartesian(xlim=c(-2,80)) +
+  geom_vline(xintercept = obs.chi.sq, color = "blue", size = 1) 
+```
+
+#PAIRWISE TEST OF INDEPENDENCE for Vp detection
+```{r}
+chi2ss <- matrix(0, nrow = 10000, ncol = 10)
+obs.chi2.ss <- numeric(10)
+pvalss <- numeric(10)
+
+for (i in 1:nrow(site.combo)){
+  #take the correct subset of data
+  
+  c <- site.combo[i, 1]
+  d <- site.combo[i, 2]
+  
+  ss <- vibrio[which(vibrio$Site == c | vibrio$Site == d), c(5, 13)]
+  
+  #find the observed chi square value
+  ss.table <- table(ss$Site, ss$Vp_Detect)
+  
+  
+  #expected counts matrix
+  ss.exp <- matrix(0, nrow = 2, ncol = 2)
+  for (j in 1:2){
+      for (k in 1:2){
+        ss.exp[j,k] <- sum(ss.table[j,])* sum(ss.table[,k])/sum(ss.table)
+      }
+    }
+  
+  obs.chi2.ss[i] <- chi2.stat(ss.table, ss.exp)
+  
+  #simulate/shuffle
+  
+  for (n in 1:10000){
+    ss$Vp_Detect <- sample(ss$Vp_Detect, size = nrow(ss), replace = FALSE)
+  
+    #compute the chi2 statistic
+    ss.table <- table(ss$Site, ss$Vp_Detect)
+    chi2ss[n,i] <- chi2.stat(ss.table, ss.exp)
+  }
+  
+  pvalss[i] <- sum(chi2ss[,i] > obs.chi2.ss[i])/10000
+  
+}
+
+  prop.inf <- as.data.frame(cbind(site.combo, obs.chi2.ss, pvalss))
+  cbind(prop.inf[order(pvalss),], ben.hoch)
+  
+  #Benjamini hochberg applied in the same way as before.
+```
+
+#TEST OF INDEPENDENCE FOR THE GENES
+```{r}
+#subset data such that we have observations where vp are detected
+vp.detected <- vibrio[vibrio$Vp_Detect == "+", ]
+vp.detected$trh <- as.factor(vp.detected$trh)
+vp.detected$tdh <- as.factor(vp.detected$tdh)
+```
+
+```{r}
+#find two way contingency table for the genes
+tdh.table <- table(vp.detected$Site, vp.detected$tdh)
+trh.table <- table(vp.detected$Site, vp.detected$trh)
+
+#find the expected counts matrix for the genes
+exp.tdh <- exp.trh <- matrix(0, nrow = 5, ncol = 2)
+
+for (i in 1:5){
+  for (j in 1:2){
+    exp.tdh[i,j] <- sum(tdh.table[i,])* sum(tdh.table[,j])/sum(tdh.table)
+    exp.trh[i,j] <- sum(trh.table[i,])* sum(trh.table[,j])/sum(trh.table)
+  }
+}
+
+#find the observed chi square statistic for the genes
+tdh.obs.chi2 <- chi2.stat(tdh.table, exp.tdh)
+trh.obs.chi2 <- chi2.stat(trh.table, exp.trh)
+
+c(tdh.obs.chi2, trh.obs.chi2)
+```
+
+```{r}
+#simulate from the assumption of the null hypothesis
+#and obtain the p value
+tdh.chi2 <- trh.chi2 <- numeric(10000)
+
+genes <- vp.detected[, c(5,45,46)]
+
+for (i in 1:10000){
+  #resampling
+  genes$tdh <- sample(genes$tdh, size = nrow(genes), replace = FALSE)
+  genes$trh <- sample(genes$trh, size = nrow(genes), replace = FALSE)
+  
+  #rewrite the two way contingency table based on the resampling
+  tdh.simulated.table <- table(genes$Site, genes$tdh)
+  trh.simulated.table <- table(genes$Site, genes$trh)
+  
+  #compute the chi-square statistic
+  tdh.chi2[i] <- chi2.stat(tdh.simulated.table, exp.tdh)
+  trh.chi2[i] <- chi2.stat(trh.simulated.table, exp.trh)
+}
+
+tdh.p.val <- sum(tdh.chi2 > tdh.obs.chi2)/10000
+trh.p.val <- sum(trh.chi2 > trh.obs.chi2)/10000
+
+
+c(tdh.p.val, trh.p.val)
+```
+
+#PAIRWISE TEST OF INDEPENDENCE FOR GENE DETECTION
+```{r}
+tdh.chi2.ss <- trh.chi2.ss <- matrix(0, nrow = 10000, ncol = 10)
+tdh.obs.chi2.ss <- trh.obs.chi2.ss <- numeric(10)
+tdh.p.val.ss <- trh.p.val.ss <-  numeric(10)
+
+for (i in 1:10){
+  site1 <- site.combo[i,1]
+  site2 <- site.combo[i,2]
+  
+  gene.pair <- vp.detected[which(vp.detected$Site == site1 | vp.detected$Site == site2), c(5, 45,46)]
+  
+  #find the observed chi square value
+  tdh.pair.table <- table(gene.pair$Site, gene.pair$tdh)
+  
+  trh.pair.table <- table(gene.pair$Site, gene.pair$trh)
+  
+  #expected counts matrix
+  tdh.pair.exp <- trh.pair.exp <- matrix(0, nrow = 2, ncol = 2)
+  
+  for (j in 1:2){
+      for (k in 1:2){
+        tdh.pair.exp[j,k] <- sum(tdh.pair.table[j,])* sum(tdh.pair.table[,k])/sum(tdh.pair.table)
+        trh.pair.exp[j,k] <- sum(trh.pair.table[j,])* sum(trh.pair.table[,k])/sum(trh.pair.table)
+      }
+    }
+  
+  tdh.obs.chi2.ss[i] <- chi2.stat(tdh.pair.table, tdh.pair.exp)
+  trh.obs.chi2.ss[i] <- chi2.stat(trh.pair.table, trh.pair.exp)
+  
+  for (n in 1:10000){
+    #resampling
+    gene.pair$tdh <- sample(gene.pair$tdh, size = nrow(gene.pair), replace = FALSE)
+    gene.pair$trh <- sample(gene.pair$trh, size = nrow(gene.pair), replace = FALSE)
+    
+    #compute chi-square
+    tdh.pair.table <- table(gene.pair$Site, gene.pair$tdh)
+    trh.pair.table <- table(gene.pair$Site, gene.pair$trh)
+    
+    tdh.chi2.ss[n,i] <- chi2.stat(tdh.pair.table, tdh.pair.exp)
+    trh.chi2.ss[n,i] <- chi2.stat(trh.pair.table, trh.pair.exp)
+  }
+  
+    tdh.p.val.ss[i] <- sum(tdh.chi2.ss[,i] > tdh.obs.chi2.ss[i])/10000
+    trh.p.val.ss[i] <- sum(trh.chi2.ss[,i] > trh.obs.chi2.ss[i])/10000
+}
+
+tdh.pair.df <- as.data.frame(cbind(site.combo,tdh.obs.chi2.ss, tdh.p.val.ss))
+trh.pair.df <- as.data.frame(cbind(site.combo,trh.obs.chi2.ss, trh.p.val.ss))
+```
+
+```{r}
+#apply benjamini hochberg
+#Reject the null hypothesis from the last pair that the p-value is below the threshold and all the way up.
+cbind(tdh.pair.df[order(tdh.p.val.ss),], ben.hoch)
+cbind(trh.pair.df[order(trh.p.val.ss),], ben.hoch)
+```
+
+### GOAL 2 MODELING ###
+
+# DATAFRAMES USED FOR PLOTS 
+```{r}
+
+vibrio =mutate(vibrio,Vp_Detect2=as.character(Vp_Detect))
+
+# vibrio data set groups by season includes count and percentage
+df.total2 = vibrio%>%
+        group_by(Season.2) %>%
+        count(Vp_Detect2) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+# vibrio data set groups by year includes count and percentage
+df.total3 <- vibrio %>%
+        group_by(Year) %>%
+        count(Vp_Detect2) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+# added the variable Vp_Detectect2 to modify the original Vp_Detect and 
+# make it a character variable (Agua hedionda dataset)
+df.agua = mutate(df.agua, Vp_Detect2 = as.character(Vp_Detect))
+
+# groups agua hedionda subset by year and includes count and percentage.
+df.agua2 <- df.agua %>%
+        group_by(Year) %>%
+        count(Vp_Detect2) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+# groups agua hedionda by season and includes count and percentage
+df.agua3 <- df.agua %>%
+        group_by(Season.2) %>%
+        count(Vp_Detect2) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+# added the variable Vp_Detectect2 to modify the original Vp_Detect and 
+# make it a character variable (dataset of the other four sites)
+df.other= mutate(df.other, Vp_Detect2 = as.character(Vp_Detect))
+
+# group subset by year includes count and percentage (Other sites)
+df.other2 <- df.other %>%
+        group_by(Year) %>%
+        count(Vp_Detect2) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1)) 
+ 
+# group subset by season includes count and percentage (other sites)
+df.other3 <- df.other %>%
+        group_by(Season.2) %>%
+        count(Vp_Detect2) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+```
+
+# VISULAS FOR GOAL 2 CONCENTRATION OF VP #
+```{r,warning=FALSE,message=FALSE}
+# added new varaiable Years to have at hand 
+Years = sort(unique(vibrio$Year)) 
+ 
+# Boxplots for two seasons winte-spring and summer-fall
+# along with the count of observations for each
+ggplot(vibrio, aes(x=Season.2, y=New.Response,fill = Season.2))+
+  geom_boxplot() +
+  xlab("Seasons") +
+  ylab("Log Vp (MPN/g)") +
+  scale_x_discrete(labels = c("Winter-Spring","Summer-Fall")) +
+  geom_text(data = (vibrio %>% filter(New.Response != "NA") %>% count(Season.2))
+         ,mapping = aes(label = paste(n),y = 7),color ="red") +
+  labs(title = "",fill = "Season",colour = "") +
+  scale_fill_discrete(labels = c("Winter-Spring","Summer-Fall")) +
+  theme(legend.position = "none")
+
+# Boxplots for each year
+  
+ggplot(vibrio, aes(x=as.factor(Year), y=New.Response,fill = as.factor(Year)))+
+  geom_boxplot() +
+  xlab("Year") +
+  ylab("Log Vp (MPN/g)") +
+    geom_text(data = (vibrio %>% filter(New.Response != "NA")%>% count(Year))
+         ,mapping = aes(label = paste(n),y = 7, color = "Count")) +
+  labs(title = "Log Vp Concentration by Year",fill = "Year",colour = "") +
+  theme(legend.position = "none")
+
+# Boxplots for the months of January to November
+
+ggplot(vibrio, aes(x=Month, y=New.Response,fill = Month))+
+  geom_boxplot() +
+  xlab("Month") +
+  ylab("Log Vp (MPN/g)") +
+    geom_text(data = (vibrio %>% filter(New.Response != "NA") %>% count(Month))
+         ,mapping = aes(label = paste(n),y = 7, color = "Count")) +
+  labs(title = "Log Vp Concentration by Month",fill = "Month",colour = "") +
+  theme(legend.position = "none")
+
+# Scatterplot of log Vp MPN/g
+ggplot(vibrio) +
+  aes(x = Date , y = New.Response) +
+  geom_point(colour = "#0c4c8a") +
+  labs(title = "", x = "Date", y = "Log Vp (MPN/g)") 
+ 
+  
+# Calendar of the year 2012 as well as the days on which observations occurred
+calendR(year = Years[6], special.days = (vibrio%>%
+                      filter(vibrio$Year == Years[6]))$day,special.col = "lightblue" ) 
+```
+
+# VISUALS FOR GOAL 2 DETECTIONS #
+```{r}
+# bar plot of percentage of vp detected for summer-fall and winter-spring using the entire dataset 
+# values indicate the number observations for that season
+ggplot(data = df.total2, mapping = aes(x = factor(Season.2, levels=c("winter-spring","summer-fall"))
+, y = Percent, fill = Vp_Detect2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red")) +
+  labs(title = "Vibrio Detects by season for all sites",
+       x = "season",
+       y = "Percent") +geom_text(data = df.total2 %>% filter(Vp_Detect2==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='Vp Detect')
+
+# bar plot of percentage of vp detected each year
+# values indicate the number of observation for that year
+ggplot(data = df.total3, mapping = aes(x = Year, y = Percent, fill = Vp_Detect2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red")) +
+  labs(title = "Vibrio Detects by Year for all sites",
+       x = "Year",
+       y = "Percent") +geom_text(data = df.total3 %>% filter(Vp_Detect2==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='Vp Detect')
+
+# bar plot of percentage of vp detected for each year for 
+# the agua hedionda subset, values indicate the number of vp detects for that year
+ggplot(data = df.agua2, mapping = aes(x = as.factor(Year), y = Percent, fill = Vp_Detect2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red")) +
+  labs(title = "Vibrio Detects by Year for Agua Hedionda",
+       x = "Year",
+       y = "Percent") + geom_text(data = df.agua2 %>% filter(Vp_Detect2==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='Vp Detect')
+
+# bar plot of percentage of vp detected for each season for the
+# agua hedionda subset, values indicate the number of vp detects for that season
+ggplot(data = df.agua3, mapping = aes(x = factor(Season.2, levels=c("winter-spring","summer-fall")), y = Percent, fill = Vp_Detect2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red")) +
+  labs(title = "Vibrio Detects by Year Agua",
+       x = "season",
+       y = "Percent") + geom_text(data = df.agua3 %>% filter(Vp_Detect2==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='Vp Detect')
+
+# bar plot of percentage of vp detected each year for the
+# four remaing sites, values indicate the number of vp detects for that year 
+ggplot(data = df.other2, mapping = aes(x = as.factor(Year), y = Percent, fill = Vp_Detect2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red")) +
+  labs(title = "Vibrio Detects by Year for remaining sites",
+       x = "Year",
+       y = "Percent") + geom_text(data = df.other2 %>% filter(Vp_Detect2==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='Vp Detect')
+
+# bar plot of percentage of vp detect for each season for the 
+# four remaining sites, values indicate number of detects for that season
+ggplot(data = df.other3, mapping = aes(x = factor(Season.2, levels=c("winter-spring","summer-fall")), y = Percent, fill = Vp_Detect2)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red")) +
+  labs(title = "Vibrio Detects by season for remaining sites",
+       x = "Year",
+       y = "Percent") +geom_text(data = df.other3 %>% filter(Vp_Detect2==1) 
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='Vp Detect')
+
+
+#creates dataframes grouped by year and season for trh.  
+df.trh2 <- vp.detected %>%
+        group_by(Year) %>%
+        count(trh_detect) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+df.trh3 <- vp.detected %>%
+        group_by(Season.2) %>%
+        count(trh_detect) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+# the plots below illustrate trh detection rate by year and season respectively (for the enitre dataset)
+ggplot(data = df.trh2, mapping = aes(x = Year, y = Percent, fill = factor(trh_detect))) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red2")) +
+  labs(title = "trh Detects by Year ",
+       x = "Year",
+       y = "Percent") +geom_text(data = df.trh2 %>% filter(trh_detect==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='trh Detect')
+
+
+ggplot(data = df.trh3, mapping = aes(x = factor(Season.2, levels=c("winter-spring","summer-fall")), y = Percent, fill = factor(trh_detect))) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red2")) +
+  labs(title = "trh Detects by season",
+       x = "Season",
+       y = "Percent") +geom_text(data = df.trh3 %>% filter(trh_detect==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='trh Detect')
+ 
+# creates dataframes grouped by year and season for tdh. 
+df.tdh2 <- vp.detected %>%
+        group_by(Year) %>%
+        count(tdh_detect) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+
+df.tdh3 <- vp.detected %>%
+        group_by(Season.2) %>%
+        count(tdh_detect) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+# the plots below illustrate tdh detection rate by year and season respectively (for the enitre dataset)
+ggplot(data = df.tdh2, mapping = aes(x = Year, y = Percent, fill = factor(tdh_detect))) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red2")) +
+  labs(title = "tdh Detects by Year ",
+       x = "Year",
+       y = "Percent") +geom_text(data = df.tdh2 %>% filter(tdh_detect==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='tdh Detect')
+
+ggplot(data = df.tdh3, mapping = aes(x = factor(Season.2, levels=c("winter-spring","summer-fall")), y = Percent, fill = factor(tdh_detect))) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red2")) +
+  labs(title = "tdh Detects by Season ",
+       x = "Season",
+       y = "Percent") +geom_text(data = df.tdh3 %>% filter(tdh_detect==1)
+         ,mapping = aes(label = paste(n),y = 105)) + labs(fill='tdh Detect')
+
+
+
+```
+
+# CUBIC SPLINE:YEAR
+```{r,warning=FALSE,message=FALSE}
+# since we have 14 year 3 knots were chosen 
+# since we have a cubic spline df = 3 + (# of knots) = 6
+# knots are 2012, 2013, and 2016
+attr(bs(vibrio$Year,df= 6),"knots")
+# 
+fit.year <-lm(New.Response ~ bs(Year,knots = c(2012,2013,2016)),data = vibrio )
+
+lims <- range(vibrio$Year)
+#Generating Test Data
+grid<-seq(from=lims[1], to = lims[2])
+
+# scatter plot with cubic spline curve (Year)
+ggplot(vibrio) +
+ geom_point(aes(x = Year, y = New.Response),colour = "#0c4c8a")+
+ geom_line(data = data.frame(x=grid,y=predict(fit.year,newdata = list(Year=grid))), aes(x=grid, y = y,colour = "Cubic Spline")) + 
+ scale_colour_manual(values=c("dark green"))+ 
+ geom_vline(xintercept = c(2012,2013,2016), linetype="dotted",size=1,alpha=.5) +
+ labs(y="Log Vp (MPN/g)", color = "Curve",title = "Trends by Year") 
+ 
+ 
+
+```
+
+# CUBIC SPLINE: MONTH
+```{r,warning=FALSE,message=FALSE}
+# used one knot, 8
+attr(bs(as.numeric(vibrio$Month),df= 4),"knots")
+
+fit.month <-lm(New.Response ~ bs(as.numeric(Month),knots = c(8)),data = vibrio )
+# summary(fit)
+lims <- range(as.numeric(vibrio$Month)) 
+#Generating Test Data 
+grid <-seq(from=lims[1], to = lims[2])
+
+# scatter plot with cubic spline curve (Month)
+ggplot(vibrio) +
+ geom_point(aes(x = as.numeric(Month), y = New.Response),colour = "#0c4c8a")+
+ geom_line(data = data.frame(x=grid,y=predict(fit.month,newdata = list(Month=grid))), aes(x=grid, y = y,colour = "Cubic Spline")) +
+ scale_colour_manual(values=c("dark green")) +
+ geom_vline(xintercept = c(8), linetype="dotted",size=1) +
+ labs(x= "Month",y="Log Vp (MPN/g)", color = "Curve",title = "Trends by Month") 
+
+
+```
+
+# CROSS-VALIDATED LOGISTIC REGRESSION MODELS FOR AGUA HEDIONDA
+```{r}
+# 10-fold cross-validation over Agua Hedionda subset 
+
+#takes only needed columns for dataset which include season, year, Vp Detection.
+CV.agua = df.agua[which(!is.na(df.agua$Vp_MPN_g_log)) , c( 13,39,44)] 
+ 
+k.agua = 10 
+n.agua = dim(CV.agua)[1]
+set.seed(100)
+samp.index.agua = sample(1:n.agua,n.agua,replace=F)
+rows.agua = k.agua 
+cols.agua = floor(n.agua/k.agua)
+samp.matrix.agua = matrix(samp.index.agua[1:(cols.agua*rows.agua)],nrow=rows.agua)
+dim(samp.matrix.agua)
+me.agua =matrix(0,3,k.agua)
+
+#evaluates all the models over 10 iterations
+for(j in 1:k.agua){
+		test.agua = CV.agua[samp.matrix.agua[j,],]
+		train.agua = CV.agua[-samp.matrix.agua[j,],]
+		x.agua = train.agua[,-c(1)]
+		y2.agua = as.numeric(train.agua$Vp_Detect)
+		x1.agua = test.agua[,-c(1)]
+		
+		y2.test.agua = as.numeric(test.agua$Vp_Detect)
+
+
+   ### model with Year
+    cv.log8 <- glm(y2.agua ~ Year, data = cbind(y2.agua,x.agua) , family =binomial)
+    cv.log8.probs <- predict(cv.log8, x1.agua ,type = "response")
+    cv.log8.p <- rep("no ", cols.agua)
+    cv.log8.p[cv.log8.probs > .5] <- "yes"
+    me.agua[1,j] = sum(diag(table(cv.log8.p, y2.test.agua)))/cols.agua
+
+   ### model with season
+    cv.log10 <- glm(y2.agua ~ Season.2, data = cbind(y2.agua,x.agua) , family =binomial)
+    cv.log10.probs <- predict(cv.log10, x1.agua ,type = "response")
+    cv.log10.p <- rep("no ", cols.agua)
+    cv.log10.p[cv.log10.probs > .5] <- "yes"
+    me.agua[2,j] = sum(diag(table(cv.log10.p, y2.test.agua)))/cols.agua
+
+   ### model with Year+season
+    cv.log12 <- glm(y2.agua ~ Year+Season.2, data = cbind(y2.agua,x.agua) , family =binomial)
+    cv.log12.probs <- predict(cv.log12, x1.agua ,type = "response")
+    cv.log12.p <- rep("no ", cols.agua)
+    cv.log12.p[cv.log12.probs > .5] <- "yes"
+    me.agua[3,j] = sum(diag(table(cv.log12.p, y2.test.agua)))/cols.agua
+}
+
+
+final.accurs=me.agua
+
+row.names(final.accurs)=c("Year","Season","Year+Season")
+
+## finding mean and SD of resulting
+## accuracy rates for each cv
+## saves values in variable for plotting
+mean.final.accurs = apply(me.agua,1,mean)
+sd.final.accurs = apply(me.agua,1,sd)
+output = data.frame("Mean.CV.Accur" = mean.final.accurs, 
+                    "LB" = (mean.final.accurs - sd.final.accurs/sqrt(10)), 
+                    "UB" = (mean.final.accurs + sd.final.accurs/sqrt(10)))
+
+output # mean, lowerbound and upper bound of the above models
+
+# plots mean, lower bound, and upper bound of the above models
+ggplot(data = output, mapping = aes(x = rownames(final.accurs), y = mean.final.accurs, 
+color = rownames(final.accurs))) + 
+geom_point()  + xlab("Models") + ylab("CV Accuracy Rate for Agua Hedionda") +
+geom_errorbar(aes(ymin = mean.final.accurs - sd.final.accurs/sqrt(10)),
+              ymax = (mean.final.accurs + sd.final.accurs/sqrt(10)), width=.2,
+              position=position_dodge(0.05)) +  ylim(0.35, 0.8) + labs(color='Model')
+
+
+
+```
+
+# CROSS-VALIDATED LOGISTIC REGRESSION MODELS FOR THE FOUR REMAINING SITES
+```{r}
+# 10-fold cross-validation over 4 other sites subset
+
+#takes only needed columns for dataset which include season, year, Vp Detection.
+CV.other = df.other[which(!is.na(df.other$Vp_MPN_g_log)) , c( 13,39,44)]
+
+k.other = 10
+n.other = dim(CV.other)[1]
+set.seed(100)
+samp.index.other = sample(1:n.other,n.other,replace=F)
+rows.other = k.other
+cols.other = floor(n.other/k.other)
+samp.matrix.other = matrix(samp.index.other[1:(cols.other*rows.other)],nrow=rows.other)
+dim(samp.matrix.other)
+me.other =matrix(0,3,k.other)
+
+#evaluates all the models over 10 iterations
+for(j in 1:k.other){
+		test.other = CV.other[samp.matrix.other[j,],]
+		train.other = CV.other[-samp.matrix.other[j,],]
+		x.other = train.other[,-c(1)]
+		y2.other = as.numeric(train.other$Vp_Detect)
+		x1.other = test.other[,-c(1)]
+		
+		y2.test.other = as.numeric(test.other$Vp_Detect)
+
+
+   ### model with Year
+    cv.log9 <- glm(y2.other ~ Year, data = cbind(y2.other,x.other) , family =binomial)
+    cv.log9.probs <- predict(cv.log9, x1.other ,type = "response")
+    cv.log9.p <- rep("no ", cols.other)
+    cv.log9.p[cv.log9.probs > .5] <- "yes"
+    me.other[1,j] = sum(diag(table(cv.log9.p, y2.test.other)))/cols.other
+
+   ### model with season
+    cv.log11 <- glm(y2.other ~ Season.2, data = cbind(y2.other,x.other) , family =binomial)
+    cv.log11.probs <- predict(cv.log11, x1.other ,type = "response")
+    cv.log11.p <- rep("no ", cols.other)
+    cv.log11.p[cv.log11.probs > .5] <- "yes"
+    me.other[2,j] = sum(diag(table(cv.log11.p, y2.test.other)))/cols.other
+
+   ### model with year+season
+    cv.log13 <- glm(y2.other ~ Year+Season.2, data = cbind(y2.other,x.other) , family =binomial)
+    cv.log13.probs <- predict(cv.log13, x1.other ,type = "response")
+    cv.log13.p <- rep("no ", cols.other)
+    cv.log13.p[cv.log13.probs > .5] <- "yes"
+    me.other[3,j] = sum(diag(table(cv.log13.p, y2.test.other)))/cols.other
+}
+
+final.accurs2=me.other
+
+row.names(final.accurs2)=c("Year","Season","Year+Season")
+
+## finding mean and SD of resulting
+## accuracy rates for each cv
+## saves values in variable for plotting
+mean.final.accurs2 = apply(me.other,1,mean)
+sd.final.accurs2 = apply(me.other,1,sd)
+output2 = data.frame("Mean.CV.Accur" = mean.final.accurs2, 
+                    "LB" = (mean.final.accurs2 - sd.final.accurs2/sqrt(10)), 
+                    "UB" = (mean.final.accurs2 + sd.final.accurs2/sqrt(10)))
+
+output2 # mean, lower bound and upper bound for the above models.
+
+# plot of mean, lower bound and upper bound for the above models.
+ggplot(data = output2, mapping = aes(x = rownames(final.accurs2), y = mean.final.accurs2, 
+color = rownames(final.accurs2))) + 
+geom_point()  + xlab("Models") + ylab("CV Accuracy Rate for other sites") + geom_errorbar(aes(ymin = mean.final.accurs2 - sd.final.accurs2/sqrt(10)),
+              ymax = (mean.final.accurs2 + sd.final.accurs2/sqrt(10)), width=.2,
+              position=position_dodge(0.05)) +  ylim(0.6, 0.65) + labs(color='Model')
+```
+
+# TEST OF HOMOGENEITY 
+```{r}
+#run proportion inference on Agua Hedionda to compare Vp detection rate by season.  Agua has 14/33 and 108/136 detections for winter-spring and summer-fall respectively
+aguaprop=prop.test(c(14,108),c(33,136),p = NULL, alternative = "less",correct = TRUE)
+aguaprop
+
+#run proportion inference on 4 others sites to compare Vp detection rate by season.  Agua has 7/29 and 190/517 detections for winter-spring and summer-fall respectively
+otherprop=prop.test(c(7,190),c(29,517),p = NULL, alternative = "less",correct = TRUE)
+otherprop
+
+#run proportion inference on whole dataset to compare trh detection rate by season.  There are 1/21 and 86/298 detections for winter-spring and summer-fall respectively
+trhprop=prop.test(c(1,86),c(21,298),p = NULL, alternative = "less",correct = TRUE)
+trhprop
+ 
+#run proportion inference on whole dataset to compare tdh detection rate by season.  There are 1/21 and 54/298 detections for winter-spring and summer-fall respectively
+tdhprop=prop.test(c(1,54),c(21,298),p = NULL, alternative = "less",correct = TRUE)
+tdhprop
+ 
+```
+
+### GOAL 3 MODELING ###
+```{r}
+# PLOTTING VISUALS FOR MISSING DATA OF ENVIRONMENTAL VARIABLES
+
+df6 <- data.frame(colSums(is.na(vibrio[,c(32:37)])))
+df6 <- df6 %>%
+        rename(Count = colSums.is.na.vibrio...c.32.37....) %>%
+        mutate(Percent = round(Count / sum(715)*100, digits = 0))
+Environmental <- c("Chlorophyll", "Conductivity", "Salinity", "Temperature", "Turbidity", "Oxygen")
+Observations <- 715 - df6$Count
+df6 <- cbind(Environmental, Observations, df6)
+df6$Environmental <- factor(df6$Environmental,
+                        levels = df6$Environmental[order(df6$Percent, decreasing = TRUE)]) # Factor levels in decreasing order
+
+
+# Showing percentage of missing values for each environmental variable
+fig1 <- ggplot(data = df6, mapping = aes(x = Environmental, y = Count)) +
+  geom_bar(stat = "identity", fill = "red3") +
+  geom_text(mapping = aes(label = paste(Percent,"%", sep = ""), y = Percent)) +
+  scale_y_continuous(limits = c(0,715)) +
+  # labs(title = "Environmental Variables: Missing Data",
+  #             x = "Environmental Variable",
+  #             y = "Count")
+  labs(x = "", y = "Observation Count")
+
+# Shows observations count for each environmental variable
+fig2 <- ggplot(data = df6, mapping = aes(x = Environmental, y = Observations)) +
+          geom_bar(stat = "identity", fill = "green3") +
+          geom_text(mapping = aes(label = paste(Observations), y = Observations)) +
+          scale_y_continuous(limits = c(0,715)) +
+          # labs(title = "Environmental Variables: Observation Count",
+          #      x = "Environmental Variable",
+          #      y = "# of Observations")
+          labs(x = "", y = "Observation Count")
+
+# ggarrange(fig1, fig2, nrow = 2, ncol = 1)
+
+fig1
+fig2
+```
+
+```{r message=FALSE, warning=FALSE}
+fig1 <- ggplot(data = vibrio %>%
+                filter(sea_water_practical_salinity != "NA")) +
+                geom_point(mapping = aes(x = sea_water_practical_salinity, y = Vp_MPN_g_log), col = 3) +
+                geom_smooth(mapping = aes(x = sea_water_practical_salinity, y = Vp_MPN_g_log),
+                            method = "loess", size = 0.5, color = "orange", se = FALSE) +
+                theme(legend.position = "none") +
+                labs(title = "Salinity vs. Vp",
+                     x = "Salinity (psu)",
+                     y = "Log Vp (MPN/g)")
+fig2 <- ggplot(data = vibrio %>%
+                filter(sea_water_temperature != "NA")) +
+                geom_point(mapping = aes(x = sea_water_temperature, y = Vp_MPN_g_log), col = 4) +
+                geom_smooth(mapping = aes(x = sea_water_temperature, y = Vp_MPN_g_log),
+                            method = "loess", size = 0.5, color = "orange", se = FALSE) +
+                theme(legend.position = "none") +
+                labs(title = "Temperature vs. Vp",
+                     x = "Temperature (Celcius)",
+                     y = "Log Vp (MPN/g)")
+
+fig3 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_practical_salinity != "NA")) +
+          geom_boxplot(mapping = aes(x = Vp_Detect, y = sea_water_practical_salinity), col = 2) +
+          labs(title = "Salinity by Detection", x = "Vp Detect", y = "Salinity (psu)")
+
+fig4 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA")) +
+          geom_boxplot(mapping = aes(x = Vp_Detect, y = sea_water_temperature), col = 3) +
+          labs(title = "Temperature by Detection", x = "Vp Detect", y = "Temperature (Celcius)")
+
+fig5 <- ggplot(data = vibrio %>% filter(vibrio$mass_concentration_of_chlorophyll_in_sea_water != "NA")) +
+          geom_boxplot(mapping = aes(x = Vp_Detect, y = mass_concentration_of_chlorophyll_in_sea_water), col = 4) +
+          labs(title = "Chlorophyll by Detection", x = "Vp Detect", y = "Chlorophyll (micrograms/L)")
+
+fig6 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_electrical_conductivity != "NA")) +
+          geom_boxplot(mapping = aes(x = Vp_Detect, y = sea_water_electrical_conductivity), col = 5) +
+          labs(title = "Electrical Conductivity by Detection", x = "Vp Detect", y = "Electrical Conductivity (ms/cm)")
+
+fig7 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_turbidity != "NA")) +
+          geom_boxplot(mapping = aes(x = Vp_Detect, y = sea_water_turbidity), col = 6) +
+          labs(title = "Sea Water Turbidity by Detection", x = "Vp Detect", y = "urbidity (ntu)")
+
+fig8 <- ggplot(data = vibrio %>% filter(vibrio$mass_concentration_of_oxygen_in_sea_water != "NA")) +
+          geom_boxplot(mapping = aes(x = Vp_Detect, y = mass_concentration_of_oxygen_in_sea_water), col = 7) +
+          labs(title = "Oxygen concentration by Detection", x = "Vp Detect", y = "Oxygen (milligrams/L)")
+
+ggarrange(fig1, fig2, nrow = 2, ncol = 1)
+ggarrange(fig3, fig4, nrow = 1, ncol = 2) # salinity and temperature
+ggarrange(fig5, fig6, fig7, fig8, nrow = 2, ncol = 2) # other environmental variables
+
+fig9 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA")) +
+          geom_boxplot(mapping = aes(x = Site, y = sea_water_temperature, col = Site)) +
+          theme(legend.position = "none") +
+          labs(title = "Temperature by Site", x = "Site", y = "Temperature (Celsius)")
+
+fig10 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_practical_salinity != "NA")) +
+          geom_boxplot(mapping = aes(x = Site, y = sea_water_practical_salinity, col = Site)) +
+          theme(legend.position = "none") +
+          labs(title = "Salinity by Site", x = "Site", y = "Seawater Salinity (psu)")
+
+fig11 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA" & vibrio$Vp_Detect == 1)) +
+          geom_boxplot(mapping = aes(x = tdh, y = sea_water_temperature), col = 2) +
+          labs(title = "Temperature: tdh Detection", x = "tdh", y = "Temperature (Celcius)")
+
+fig12 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA" & vibrio$Vp_Detect == 1)) +
+          geom_boxplot(mapping = aes(x = trh, y = sea_water_temperature), col = 2) +
+          labs(title = "Temperature: trh Detection", x = "trh", y = "Temperature (Celcius)")
+
+fig13 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA")) +
+          geom_boxplot(mapping = aes(x = factor(Year), y = sea_water_temperature, fill = factor(Year))) +
+          labs(title = "Temperature by Year", x = "Year", y = "Temperature (Celcius)", fill = "Year")
+
+fig14 <- ggplot(data = vibrio %>% filter(vibrio$Vp_MPN_g_log != "NA"),
+                mapping = aes(x = Site, y = Vp_MPN_g_log, fill = Site)) +
+          geom_flat_violin(position = position_nudge(x = .2, y = 0), alpha = .8, trim = FALSE) +
+          geom_boxplot(width = .1, outlier.shape = NA, alpha = 0.5) +
+          guides(fill = FALSE) +
+          guides(color = FALSE) +
+          scale_color_brewer(palette = "Spectral") +
+          scale_fill_brewer(palette = "Spectral") +
+          coord_flip() +
+          theme_bw() +
+          # theme(legend.position = "none") +
+          labs(title = "Distribution by Site", x = "Site", y = "Log Vp (MPN/g)", fill = "Year")
+
+fig15 <- ggplot(data = vibrio %>% filter(sea_water_practical_salinity != "NA")) +
+                geom_boxplot(mapping = aes(y = sea_water_practical_salinity), col = 3) +
+                scale_x_discrete() +
+                labs(title = "Salinity",
+                     y = "Salinity (psu)")
+fig16 <- ggplot(data = vibrio %>% filter(sea_water_temperature != "NA")) +
+                geom_boxplot(mapping = aes(y = sea_water_temperature), col = 4) +
+                scale_x_discrete() +
+                labs(title = "Seawater Temperature",
+                     y = "Temperature (Celsius)")
+
+fig17 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_practical_salinity != "NA" & vibrio$Vp_Detect == 1)) +
+          geom_boxplot(mapping = aes(x = tdh, y = sea_water_practical_salinity), col = 2) +
+          labs(title = "Salinity: tdh Detection", x = "tdh", y = "Salinity (psu)")
+
+fig18 <- ggplot(data = vibrio %>% filter(vibrio$sea_water_practical_salinity != "NA" & vibrio$Vp_Detect == 1)) +
+          geom_boxplot(mapping = aes(x = trh, y = sea_water_practical_salinity), col = 2) +
+          labs(title = "Salinity: trh Detection", x = "trh", y = "Salinity (psu)")
+
+ggarrange(fig4, fig9, nrow = 2, ncol = 1)
+ggarrange(fig11, fig12, nrow = 1, ncol = 2)
+ggarrange(fig17, fig18, nrow = 1, ncol = 2)
+fig13
+fig14
+ggarrange(fig15, fig16, nrow = 1, ncol = 2)
+```
+
+```{r}
+model_data <- vibrio[,c(11,13,15,32:37)]
+
+# reassign indices
+rownames(model_data) <- 1:nrow(model_data)
+
+df7 <- as.data.frame(table(apply(is.na(model_data), 1, sum)))
+table(apply(is.na(model_data), 2, sum))
+
+model_data <- model_data[apply(is.na(model_data), 1, sum) <= 4, ]
+
+# Drop chlorophyll, conductivity, turbidity, and oxygen because there are too many missing values
+model_data <- model_data[,-c(4,5,8,9)]
+
+# Use the MI package to impute missing values
+model.df <- mi(model_data, seed = 539)
+model.df <- complete(model.df)
+model.df <- model.df$`chain:1`
+
+# CHANGE FOR TEMPERATURE ONLY
+# model_data2 <- vibrio[,c(11,34)]
+# model_data2 <- model_data2[!is.na(model_data2$sea_water_temperature), ]
+# model_data2 <- na.omit(model_data2) # remove 9 missing values
+
+model.df2 <- vibrio[,c(13,35)]
+model.df2 <- model.df2[!is.na(model.df2$sea_water_temperature), ]
+
+# sapply(model_data, function(x) sum(is.na(x))) # count how many NA's per column
+```
+
+```{r}
+# This plot shows the number of rows with missing values. For example, there is 14 rows where there are values for all 6 environmental variables. There are 6 rows where there is 1 environmental value missing, ... and so on.
+
+df7$Freq <- as.numeric(df7$Freq)
+df7 <- df7[c(1:6),]
+
+ggplot(data = df7, mapping = aes(x = Var1, y = Freq)) +
+  geom_bar(stat = "identity", fill = "red3") +
+  geom_text(mapping = aes(label = paste(Freq), y = Freq)) +
+  # labs(title = "Complete Cases",
+  #       x = "# of Rows with Count of Missing Values",
+  #       y = "Observation Count")
+  labs(x = "", y = "Observation Count")
+```
+
+## TEMPERATURE AND SALINITY AS THE PREDICTORS (183 observations)
+
+## THESE CLASSIFICATION MODELS ARE USING TEMPERATURE AND SALINITY AS PREDICTORS. THE RESPONSE VARIABLE IS VP DETECT.
+
+```{r, echo=FALSE}
+# K-fold Cross Validation Set-Up
+
+  n <- nrow(model.df)
+  k <- 5 # 5-fold cross validation
+  model.df <- model.df[sample(x = n, size = n, replace = FALSE), ]
+  accuracy.vec <- rep(0,3) # initialize accuracy vector
+  se.vec <- rep(0,3) # initialize standard error vector
+
+  # create our "k.folds" matrix that splits data into train and test
+  set.seed(539)
+  sample.rows <- sample(1:n)
+  cols <- floor(n/k)
+  k.folds <- matrix(sample.rows[1:(cols*k)], nrow = k)
+```
+
+```{r, echo=FALSE}
+# LOGISTIC REGRESSION
+
+set.seed(33)
+
+glm.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- model.df[test.index,]
+  train <- model.df[train.index,]
+    
+  # fit the logistic regression model
+  
+  glm.model <- glm(as.factor(Vp_Detect) ~ sea_water_temperature + sea_water_practical_salinity,
+                data = train, family = binomial)
+  glm.pred <- predict(glm.model, test, type = "response")
+  glm.confusion.matrix <- table(actual = test$Vp_Detect, predicted = glm.pred > 0.5)
+  glm.accuracy[i] <- (glm.confusion.matrix[1,1] + glm.confusion.matrix[2,2]) / nrow(test)
+}
+  accuracy.vec[1] <- sum(glm.accuracy) / k
+  se.vec[1] <- sd(glm.accuracy) / sqrt(k)
+```
+
+```{r}
+  # Tuning for Decision Trees
+  tune.dtree <- tune.rpart(formula = Vp_Detect ~ sea_water_temperature + sea_water_practical_salinity, data = model.df,
+                           minsplit = seq(from = 10, to = 100, by = 5),
+                           cp = seq(from = 0.01, to = 0.2, by = 0.01))
+  best.minsplit <- tune.dtree$best.parameters[1,1]
+  best.cp <- tune.dtree$best.parameters[1,2]
+```
+
+```{r}
+# DECISION TREES
+
+set.seed(33)
+
+tree.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- model.df[test.index,]
+  train <- model.df[train.index,]
+    
+  # fit the decision tree model
+  
+  tree.model <- rpart(Vp_Detect ~ sea_water_temperature + sea_water_practical_salinity, data = train,
+                      control = rpart.control(minsplit = best.minsplit, cp = best.cp))
+  tree.pred <- predict(tree.model, test, type = "class")
+  tree.confusion.matrix <- table(tree.pred, test$Vp_Detect)
+  tree.accuracy[i] <- (tree.confusion.matrix[1,1] + tree.confusion.matrix[2,2]) / nrow(test)
+}
+  accuracy.vec[2] <- sum(tree.accuracy) / k
+  se.vec[2] <- sd(tree.accuracy) / sqrt(k)
+```
+
+```{r}
+# KNN
+
+set.seed(33)
+
+knn.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+  
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- model.df[test.index,]
+  train <- model.df[train.index,]
+
+  train.X <- cbind(train$sea_water_temperature, train$sea_water_practical_salinity)
+  test.X <- cbind(test$sea_water_temperature, test$sea_water_practical_salinity)
+  knn.pred <- knn(train.X, test.X, train$Vp_Detect, k = 3)
+  knn.confusion.matrix <- table(knn.pred, test$Vp_Detect)
+  knn.accuracy[i] <- (knn.confusion.matrix[1,1] + knn.confusion.matrix[2,2]) / nrow(test)
+}
+  accuracy.vec[3] <- sum(knn.accuracy) / k
+  se.vec[3] <- sd(knn.accuracy) / sqrt(k)
+
+```
+
+```{r}
+names(accuracy.vec) <- c("Logit","Trees","KNN")
+names(se.vec) <- c("Logit","Trees","KNN")
+accuracy.df <- as.data.frame(cbind(accuracy.vec, se.vec))
+
+fig1 <- ggplot(data = accuracy.df, mapping = aes(x = rownames(accuracy.df), y = accuracy.vec, color = rownames(accuracy.df))) +
+          geom_point() +
+          geom_errorbar(data = accuracy.df, mapping = aes(ymin = accuracy.vec-se.vec, ymax = accuracy.vec+se.vec),
+                        width = 0.2, position = position_dodge(0.05)) +
+          theme(legend.position = "none") +
+          labs(title = "Cross-Validation Accuracy Rate for Temperature and Salinity Models",
+          x = "Model", y = "Accuracy Rate", color = "Model")
+```
+
+## TEMPERATURE ONLY AS THE PREDICTOR (324 observations)
+
+```{r, echo=FALSE}
+# K-fold Cross Validation Set-Up
+
+  n <- nrow(model.df2)
+  k <- 5 # 5-fold cross validation
+  model.df2 <- model.df2[sample(x = n, size = n, replace = FALSE), ]
+  accuracy.vec <- rep(0,3) # initialize accuracy vector
+  se.vec <- rep(0,3) # initialize standard error vector
+
+  # create our "k.folds" matrix that splits data into train and test
+  set.seed(539)
+  sample.rows <- sample(1:n)
+  cols <- floor(n/k)
+  k.folds <- matrix(sample.rows[1:(cols*k)], nrow = k)
+```
+
+```{r, echo=FALSE}
+# LOGISTIC REGRESSION
+
+set.seed(33)
+
+glm.accuracy <- rep(0,k)
+
+df9 <- data.frame()
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- model.df2[test.index,]
+  train <- model.df2[train.index,]
+    
+  # fit the logistic regression model
+  
+  glm.model <- glm(as.factor(Vp_Detect) ~ sea_water_temperature,
+                data = train, family = binomial)
+  glm.pred <- predict(glm.model, test, type = "response")
+  glm.confusion.matrix <- table(actual = test$Vp_Detect, predicted = glm.pred > 0.5)
+  glm.accuracy[i] <- (glm.confusion.matrix[1,1] + glm.confusion.matrix[2,2]) / nrow(test)
+  
+  df8 <- cbind(data.frame(glm.pred), test)
+  df9 <- rbind(df8,df9)
+}
+  accuracy.vec[1] <- sum(glm.accuracy) / k
+  se.vec[1] <- sd(glm.accuracy) / sqrt(k)
+```
+
+```{r}
+# DECISION TREES
+
+set.seed(33)
+
+tree.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+    
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- model.df2[test.index,]
+  train <- model.df2[train.index,]
+    
+  # fit the decision tree model
+  
+  tree.model <- rpart(Vp_Detect ~ sea_water_temperature, data = train,
+                      control = rpart.control(minsplit = best.minsplit, cp = best.cp))
+  tree.pred <- predict(tree.model, test, type = "class")
+  tree.confusion.matrix <- table(tree.pred, test$Vp_Detect)
+  tree.accuracy[i] <- (tree.confusion.matrix[1,1] + tree.confusion.matrix[2,2]) / nrow(test)
+}
+  accuracy.vec[2] <- sum(tree.accuracy) / k
+  se.vec[2] <- sd(tree.accuracy) / sqrt(k)
+```
+
+```{r}
+# KNN
+
+set.seed(33)
+
+knn.accuracy <- rep(0,k)
+
+for (i in 1:k) {
+  
+  test.index <- as.numeric(k.folds[i,])
+  train.index <- as.numeric(k.folds[-i,])
+    
+  test <- model.df2[test.index,]
+  train <- model.df2[train.index,]
+  
+  train.X <- cbind(train$sea_water_temperature)
+  test.X <- cbind(test$sea_water_temperature)
+  knn.pred <- knn(train.X, test.X, train$Vp_Detect, k = 3)
+  knn.confusion.matrix <- table(knn.pred, test$Vp_Detect)
+  knn.accuracy[i] <- (knn.confusion.matrix[1,1] + knn.confusion.matrix[2,2]) / nrow(test)
+}
+  accuracy.vec[3] <- sum(knn.accuracy) / k
+  se.vec[3] <- sd(knn.accuracy) / sqrt(k)
+
+```
+
+```{r}
+# PLOTTING ACCURACY AND STANDARD ERROR FOR ALL MODELS
+
+names(accuracy.vec) <- c("Logit","Trees","KNN")
+names(se.vec) <- c("Logit","Trees","KNN")
+accuracy.df <- as.data.frame(cbind(accuracy.vec, se.vec))
+
+fig2 <- ggplot(data = accuracy.df, mapping = aes(x = rownames(accuracy.df), y = accuracy.vec, color = rownames(accuracy.df))) +
+          geom_point() +
+          geom_errorbar(data = accuracy.df, mapping = aes(ymin = accuracy.vec-se.vec, ymax = accuracy.vec+se.vec),
+                        width = 0.2, position = position_dodge(0.05)) +
+          theme(legend.position = "none") +
+          labs(title = "Cross-Validation Accuracy Rate for Temperature Only Models",
+          x = "Model", y = "Accuracy Rate", color = "Model")
+
+ggarrange(fig1, fig2, nrow = 2, ncol = 1)
+```
+
+```{r}
+# LOGISTIC REGRESSION VISUALLY
+
+df8 <- cbind(data.frame(glm.pred), test)
+
+ggplot() +
+  geom_point(data = df8, mapping = aes(x = sea_water_temperature, y = glm.pred)) +
+  geom_point(mapping = aes(x = 17.5, y = 0.5), col = "red", size = 3) +
+  scale_y_continuous(limits = c(0.17,0.91)) +
+  labs(title = "Logistic Regression Model", x = "Seawater Temperature (Celsius)", y = "Predicted Probability of Vp Detect")
+
+```
+
+
+```{r}
+# DECISION TREES VISUALLY
+
+# Visualize the decision tree with rpart.plot
+rpart.plot(tree.model, box.palette = "RdBu", shadow.col = "gray", nn = TRUE)
+```
+
+### Goal 1: EXTRA CODE NOT USED IN THE REPORT ###
+# AGUA HEDIONDA VS REST OF THE SITES
+```{r}
+#create binary variable to determine whether the site is agua hedionda or not
+binary.site <- as.factor(vibrio$Site)
+
+levels(binary.site) <- c("Agua Hedionda", "NOT", "NOT", "NOT", "NOT")
+
+levels(binary.site)
+
+vibrio <- as.data.frame(cbind(vibrio, binary.site))
+```
+
+```{r}
+ah.table <- table(vibrio$binary.site, vibrio$Vp_Detect)
+ah.exp <- matrix(0, nrow = 2, ncol = 2)
+
+for(i in 1:2){
+  for (j in 1:2){
+    ah.exp[i,j] <- sum(ah.table[i,])*sum(ah.table[,j])/sum(ah.table)
+  }
+}
+
+ah.obs.chisq <- chi2.stat(ah.table, ah.exp)
+#Without doing simulation, we know that 68 is too big of a chi square statistic
+#especially with df = 1
+```
+
+#permutation test Agua Hedionda vs Rest
+```{r}
+vibrio.mean <- vibrio[-which(is.na(vibrio$Vp_MPN_g)),]
+ah.vp.perm <- ah.lvp.perm <- numeric(10000)
+
+ah.vp.obs <- mean(vibrio.mean$Vp_MPN_g[which(vibrio.mean$binary.site == "Agua Hedionda")])-mean(vibrio.mean$Vp_MPN_g[-which(vibrio.mean$binary.site == "Agua Hedionda")])
+
+ah.lvp.obs <- mean(vibrio.mean$Vp_MPN_g_log[which(vibrio.mean$binary.site == "Agua Hedionda")])-mean(vibrio.mean$Vp_MPN_g_log[-which(vibrio.mean$binary.site == "Agua Hedionda")])
+
+ah.perm <- vibrio.mean[, c(11,9, 47)]
+
+for (i in 1:10000){
+  ah.perm$Vp_MPN_g <- sample(ah.perm$Vp_MPN_g, size = nrow(ah.perm), replace = FALSE)
+  ah.perm$Vp_MPN_g_log <- sample(ah.perm$Vp_MPN_g_log, size = nrow(ah.perm), replace = FALSE)
+  
+  ah.vp.perm[i] <- mean(ah.perm$Vp_MPN_g[which(ah.perm$binary.site == "Agua Hedionda")])-mean(ah.perm$Vp_MPN_g[-which(ah.perm$binary.site == "Agua Hedionda")])
+  ah.lvp.perm[i] <- mean(ah.perm$Vp_MPN_g_log[which(ah.perm$binary.site == "Agua Hedionda")])-mean(ah.perm$Vp_MPN_g_log[-which(ah.perm$binary.site == "Agua Hedionda")])
+}
+
+ah.perm.vp.p <- sum(ah.vp.perm > abs(ah.vp.obs) | ah.vp.perm < -abs(ah.vp.obs) )
+ah.perm.lvp.p <- sum(ah.lvp.perm > abs(ah.lvp.obs) | ah.lvp.perm < -abs(ah.lvp.obs) )
+```
+
+#test of independence for the genes: Agua Hedionda vs Rest
+```{r}
+vp.detected <- vibrio[vibrio$Vp_Detect == "+", ]
+# Get the table, expected counts and the observed chi-square statistic
+
+ah.tdh.table <- table(vp.detected$binary.site, vp.detected$tdh)
+ah.trh.table <- table(vp.detected$binary.site, vp.detected$trh)
+
+ah.tdh.exp <- ah.trh.exp <- matrix(0,nrow = 2, ncol = 2)
+
+for (i in 1:2){
+  for (j in 1:2){
+    ah.tdh.exp[i,j] <- sum(ah.tdh.table[i,]) * sum(ah.tdh.table[,j])/sum(ah.tdh.table)
+    ah.trh.exp[i,j] <- sum(ah.trh.table[i,]) * sum(ah.trh.table[,j])/sum(ah.trh.table)
+  }
+}
+
+ah.tdh.obs.chisq <- chi2.stat(ah.tdh.table, ah.tdh.exp)
+ah.trh.obs.chisq <- chi2.stat(ah.trh.table, ah.trh.exp)
+
+ah.trh.chisq <- ah.tdh.chisq <- numeric(10000)
+ah.tdh.trh <- vp.detected[, c(45, 46, 47)]
+
+for (n in 1:10000){
+    ah.tdh.trh$tdh <- sample(ah.tdh.trh$tdh, nrow(ah.tdh.trh), replace = FALSE)
+    ah.tdh.trh$trh <- sample(ah.tdh.trh$trh, nrow(ah.tdh.trh), replace = FALSE)
+    
+    x <- table(ah.tdh.trh$binary.site, ah.tdh.trh$tdh)
+    y <- table(ah.tdh.trh$binary.site, ah.tdh.trh$trh)
+    
+    ah.tdh.chisq[n] <- chi2.stat(x, ah.tdh.exp)
+    ah.trh.chisq[n] <- chi2.stat(y, ah.trh.exp)
+}
+
+sum(ah.tdh.chisq > ah.tdh.obs.chisq )/10000
+sum(ah.trh.chisq > ah.trh.obs.chisq )/10000
+```
+
+### GOAL 2: EXTRA CODE NOT USED IN THE REPORT ###
+# CROSS-VALIDATED LOGISTIC REGRESSION MODELS FOR VP DETECTION
+```{r}
+# 10-fold cross-validation over whole vibrio dataset 
+# where the response is vp detection 
+#takes only needed columns for dataset which include site, season, year, Vp Detection.
+CV.Vibrio = vibrio[which(!is.na(vibrio$Vp_MPN_g_log)) , c(5, 13, 39,44)]
+
+
+k = 10
+n = dim(CV.Vibrio)[1]
+set.seed(100)
+samp.index = sample(1:n,n,replace=F)
+rows = k
+cols = floor(n/k)
+samp.matrix = matrix(samp.index[1:(cols*rows)],nrow=rows)
+me =matrix(0,7,k)
+
+
+#evaluates all the models over 10 iterations
+for(j in 1:k){
+		test = CV.Vibrio[samp.matrix[j,],]
+		train = CV.Vibrio[-samp.matrix[j,],]
+		x = train[,-c(2)]
+		y2 = as.numeric(train$Vp_Detect)
+		x1 = test[,-c(2)]
+		y2.test = as.numeric(test$Vp_Detect)
+
+
+   ### model with Year
+    cv.l1 <- glm(y2 ~ Year, data = cbind(y2,x) , family =binomial)
+    cv.l1.probs <- predict(cv.l1, x1 ,type = "response")
+    cv.l1.p <- rep("no ", cols)
+    cv.l1.p[cv.l1.probs > .5] <- "yes"
+    me[1,j] = sum(diag(table(cv.l1.p, y2.test)))/cols
+
+   ### model with Year+Site
+    cv.l2 <- glm(y2 ~ Year + Site , data = cbind(y2,x) , family =binomial)
+    cv.l2.probs <- predict(cv.l2, x1 ,type = "response")
+    cv.l2.p <- rep("no ", cols)
+    cv.l2.p[cv.l2.probs > .5] <- "yes"
+    me[2,j] = sum(diag(table(cv.l2.p, y2.test)))/cols
+
+   ### model with Year+season
+    cv.l3 <- glm(y2 ~ Year + Season.2, data = cbind(y2,x) , family =binomial)
+    cv.l3.probs <- predict(cv.l3, x1 ,type = "response")
+    cv.l3.p <- rep("no ", cols)
+    cv.l3.p[cv.l3.probs > .5] <- "yes"
+    me[3,j] = sum(diag(table(cv.l3.p, y2.test)))/cols
+
+   ### model with Year+Site+season
+    cv.l4 <- glm(y2 ~ Year + Site + Season.2, data = cbind(y2,x) , family =binomial)
+    cv.l4.probs <- predict(cv.l4, x1 ,type = "response")
+    cv.l4.p <- rep("no ", cols)
+    cv.l4.p[cv.l4.probs > .5] <- "yes"
+    me[4,j] = sum(diag(table(cv.l4.p, y2.test)))/cols
+
+    # model with season    
+    cv.l5 <- glm(y2 ~ Season.2, data = cbind(y2,x) , family =binomial)
+    cv.l5.probs <- predict(cv.l5, x1 ,type = "response")
+    cv.l5.p <- rep("no ", cols)
+    cv.l5.p[cv.l5.probs > .5] <- "yes"
+    me[5,j] = sum(diag(table(cv.l5.p, y2.test)))/cols
+    
+    # model with Site
+    cv.l6 <- glm(y2 ~ Site, data = cbind(y2,x) , family =binomial)
+    cv.l6.probs <- predict(cv.l6, x1 ,type = "response")
+    cv.l6.p <- rep("no ", cols)
+    cv.l6.p[cv.l6.probs > .5] <- "yes"
+    me[6,j] = sum(diag(table(cv.l6.p, y2.test)))/cols
+    
+    # model with season+Site
+    cv.l7 <- glm(y2 ~ Season.2+Site, data = cbind(y2,x) , family =binomial)
+    cv.l7.probs <- predict(cv.l7, x1 ,type = "response")
+    cv.l7.p <- rep("no ", cols)
+    cv.l7.p[cv.l7.probs > .5] <- "yes"
+    me[7,j] = sum(diag(table(cv.l7.p, y2.test)))/cols
+
+}
+
+#prints out mean accuracy for each model
+apply(me,1,mean)
+
+
+```
+
+# CROSS-VALIDATED LOGISTIC REGRESSION MODELS FOR TRH DETECTION
+```{r}
+# 10-fold cross-validation over whole vibrio dataset for trh
+# the response is trh detection 
+#takes only needed columns for dataset which include site, season, year, trh Detection.
+trh.Vibrio = (vibrio %>%filter(Vp_Detect == 1))[ ,c(5, 45, 39,44)]
+
+k.trh = 10
+n.trh = dim(trh.Vibrio)[1]
+set.seed(100)
+samp.index.trh = sample(1:n.trh,n.trh,replace=F)
+rows.trh = k.trh
+cols.trh = floor(n.trh/k.trh)
+samp.matrix.trh = matrix(samp.index.trh[1:(cols.trh*rows.trh)],nrow=rows.trh)
+me.trh =matrix(0,7,k.trh)
+
+
+
+for(j in 1:k.trh){
+		test.trh = trh.Vibrio[samp.matrix.trh[j,],]
+		train.trh = trh.Vibrio[-samp.matrix.trh[j,],]
+		x.trh = train.trh[,-c(2)]
+		y2.trh = train.trh$trh_detect
+		x1.trh = test.trh[,-c(2)]
+		
+		y2.test.trh = test.trh$trh_detect
+
+
+   ### l1
+    cv.trhl1 <- glm(y2.trh ~ Year, data = cbind(y2.trh,x.trh) , family =binomial)
+    cv.trhl1.probs <- predict(cv.trhl1, x1.trh ,type = "response")
+    cv.trhl1.p <- rep("no ", cols.trh)
+    cv.trhl1.p[cv.trhl1.probs > .5] <- "yes"
+    me.trh[1,j] = sum(diag(table(cv.trhl1.p, y2.test.trh)))/cols.trh
+
+   ### l2
+    cv.trhl2 <- glm(y2.trh ~ Year + Site , data = cbind(y2.trh,x.trh) , family =binomial)
+    cv.trhl2.probs <- predict(cv.trhl2, x1.trh ,type = "response")
+    cv.trhl2.p <- rep("no ", cols.trh)
+    cv.trhl2.p[cv.trhl2.probs > .5] <- "yes"
+    me.trh[2,j] = sum(diag(table(cv.trhl2.p, y2.test.trh)))/cols.trh
+
+   ### l3
+    cv.trhl3 <- glm(y2.trh ~ Year + Season.2, data = cbind(y2.trh,x.trh) , family =binomial)
+    cv.trhl3.probs <- predict(cv.trhl3, x1.trh ,type = "response")
+    cv.trhl3.p <- rep("no ", cols.trh)
+    cv.trhl3.p[cv.trhl3.probs > .5] <- "yes"
+    me.trh[3,j] = sum(diag(table(cv.trhl3.p, y2.test.trh)))/cols.trh
+
+   ### l4
+    cv.trhl4 <- glm(y2.trh ~ Year + Site + Season.2, data = cbind(y2.trh,x.trh) , family =binomial)
+    cv.trhl4.probs <- predict(cv.trhl4, x1.trh ,type = "response")
+    cv.trhl4.p <- rep("no ", cols.trh)
+    cv.trhl4.p[cv.trhl4.probs > .5] <- "yes"
+    me.trh[4,j] = sum(diag(table(cv.trhl4.p, y2.test.trh)))/cols.trh
+
+    cv.trhl5 <- glm(y2.trh ~ Season.2, data = cbind(y2.trh,x.trh) , family =binomial)
+    cv.trhl5.probs <- predict(cv.trhl5, x1.trh ,type = "response")
+    cv.trhl5.p <- rep("no ", cols.trh)
+    cv.trhl5.p[cv.trhl5.probs > .5] <- "yes"
+    me.trh[5,j] = sum(diag(table(cv.trhl5.p, y2.test.trh)))/cols.trh
+    
+    cv.trhl6 <- glm(y2.trh ~ Site, data = cbind(y2.trh,x.trh) , family =binomial)
+    cv.trhl6.probs <- predict(cv.trhl6, x1.trh ,type = "response")
+    cv.trhl6.p <- rep("no ", cols.trh)
+    cv.trhl6.p[cv.trhl6.probs > .5] <- "yes"
+    me.trh[6,j] = sum(diag(table(cv.trhl6.p, y2.test.trh)))/cols.trh
+    
+    
+    cv.trhl7 <- glm(y2.trh ~ Season.2+Site, data = cbind(y2.trh,x.trh) , family =binomial)
+    cv.trhl7.probs <- predict(cv.trhl7, x1.trh ,type = "response")
+    cv.trhl7.p <- rep("no ", cols.trh)
+    cv.trhl7.p[cv.trhl7.probs > .5] <- "yes"
+    me.trh[7,j] = sum(diag(table(cv.trhl7.p, y2.test.trh)))/cols.trh
+
+
+}
+
+apply(me.trh,1,mean)
+```
+
+# CROSS-VALIDATED LOGISTIC REGRESSION MODELS FOR TDH DETECTION
+```{r}
+# 10-fold cross-validation over whole vibrio dataset for tdh
+# the response is tdh detection
+# takes only needed columns for dataset which include site, season, year, tdh Detection.
+tdh.Vibrio = (vibrio %>%filter(Vp_Detect2 == 1))[ ,c(5,46, 39,44)]
+
+k.tdh = 10
+n.tdh = dim(tdh.Vibrio)[1]
+set.seed(100)
+samp.index.tdh = sample(1:n.tdh,n.tdh,replace=F)
+rows.tdh = k.tdh
+cols.tdh = floor(n.tdh/k.tdh)
+samp.matrix.tdh = matrix(samp.index.tdh[1:(cols.tdh*rows.tdh)],nrow=rows.tdh)
+me.tdh =matrix(0,7,k.tdh)
+
+
+
+for(j in 1:k.tdh){
+		test.tdh = tdh.Vibrio[samp.matrix.tdh[j,],]
+		train.tdh = tdh.Vibrio[-samp.matrix.tdh[j,],]
+		x.tdh = train.tdh[,-c(2)]
+		y2.tdh = train.tdh$tdh_detect
+		x1.tdh = test.tdh[,-c(2)]
+		
+		y2.test.tdh = test.tdh$tdh_detect
+
+
+   ### l1
+    cv.tdhl1 <- glm(y2.tdh ~ Year, data = cbind(y2.tdh,x.tdh) , family =binomial)
+    cv.tdhl1.probs <- predict(cv.tdhl1, x1.tdh ,type = "response")
+    cv.tdhl1.p <- rep("no ", cols.tdh)
+    cv.tdhl1.p[cv.tdhl1.probs > .5] <- "yes"
+    me.tdh[1,j] = sum(diag(table(cv.tdhl1.p, y2.test.tdh)))/cols.tdh
+
+   ### l2
+    cv.tdhl2 <- glm(y2.tdh ~ Year + Site , data = cbind(y2.tdh,x.tdh) , family =binomial)
+    cv.tdhl2.probs <- predict(cv.tdhl2, x1.tdh ,type = "response")
+    cv.tdhl2.p <- rep("no ", cols.tdh)
+    cv.tdhl2.p[cv.tdhl2.probs > .5] <- "yes"
+    me.tdh[2,j] = sum(diag(table(cv.tdhl2.p, y2.test.tdh)))/cols.tdh
+
+   ### l3
+    cv.tdhl3 <- glm(y2.tdh ~ Year + Season.2, data = cbind(y2.tdh,x.tdh) , family =binomial)
+    cv.tdhl3.probs <- predict(cv.tdhl3, x1.tdh ,type = "response")
+    cv.tdhl3.p <- rep("no ", cols.tdh)
+    cv.tdhl3.p[cv.tdhl3.probs > .5] <- "yes"
+    me.tdh[3,j] = sum(diag(table(cv.tdhl3.p, y2.test.tdh)))/cols.tdh
+
+   ### l4
+    cv.tdhl4 <- glm(y2.tdh ~ Year + Site + Season.2, data = cbind(y2.tdh,x.tdh) , family =binomial)
+    cv.tdhl4.probs <- predict(cv.tdhl4, x1.tdh ,type = "response")
+    cv.tdhl4.p <- rep("no ", cols.tdh)
+    cv.tdhl4.p[cv.tdhl4.probs > .5] <- "yes"
+    me.tdh[4,j] = sum(diag(table(cv.tdhl4.p, y2.test.tdh)))/cols.tdh
+
+    cv.tdhl5 <- glm(y2.tdh ~ Season.2, data = cbind(y2.tdh,x.tdh) , family =binomial)
+    cv.tdhl5.probs <- predict(cv.tdhl5, x1.tdh ,type = "response")
+    cv.tdhl5.p <- rep("no ", cols.tdh)
+    cv.tdhl5.p[cv.tdhl5.probs > .5] <- "yes"
+    me.tdh[5,j] = sum(diag(table(cv.tdhl5.p, y2.test.tdh)))/cols.tdh
+    
+    cv.tdhl6 <- glm(y2.tdh ~ Site, data = cbind(y2.tdh,x.tdh) , family =binomial)
+    cv.tdhl6.probs <- predict(cv.tdhl6, x1.tdh ,type = "response")
+    cv.tdhl6.p <- rep("no ", cols.tdh)
+    cv.tdhl6.p[cv.tdhl6.probs > .5] <- "yes"
+    me.tdh[6,j] = sum(diag(table(cv.tdhl6.p, y2.test.tdh)))/cols.tdh
+    
+    
+    cv.tdhl7 <- glm(y2.tdh ~ Season.2+Site, data = cbind(y2.tdh,x.tdh) , family =binomial)
+    cv.tdhl7.probs <- predict(cv.tdhl7, x1.tdh ,type = "response")
+    cv.tdhl7.p <- rep("no ", cols.tdh)
+    cv.tdhl7.p[cv.tdhl7.probs > .5] <- "yes"
+    me.tdh[7,j] = sum(diag(table(cv.tdhl7.p, y2.test.tdh)))/cols.tdh
+
+
+}
+
+apply(me.tdh,1,mean)
+
+```
+
+### VISUALS: EXTRA CODE NOT USED IN THE REPORT ###
+
+```{r}
+ggplot(data = vibrio %>%
+       filter(sea_water_practical_salinity != "NA" & sea_water_temperature != "NA")) +
+       geom_point(mapping = aes(x = sea_water_temperature, y = sea_water_practical_salinity, col = 1)) +
+       theme(legend.position = "none") +
+       labs(title = "Temperature vs. Salinity",
+            x = "Sea Water Temperature (Celcius)",
+            y = "Practical Salinity (psu)")
+
+colorscale = scale_fill_gradientn(
+    colors = rev(brewer.pal(9, "YlGnBu")),
+    values = c(0, exp(seq(-5, 0, length.out = 100))))
+
+ggplot(data = vibrio %>%
+       filter(sea_water_practical_salinity != "NA" & sea_water_temperature != "NA"),
+       mapping = aes(x = sea_water_temperature, y = sea_water_practical_salinity)) +
+       stat_density2d(h = 0.5, bins = 60,
+                      aes(fill = ..level..), geom = "polygon") +
+       colorscale +
+       labs(title = "Temperature vs. Salinity",
+            x = "Sea Water Temperature (Celcius)",
+            y = "Practical Salinity (psu)")
+```
+
+```{r}
+df <- vibrio %>%
+        group_by(Site) %>%
+        count(Vp_Detect) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+df2 <- vibrio %>%
+        group_by(Month) %>%
+        count(Vp_Detect) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+df3 <- vibrio %>%
+        group_by(Year) %>%
+        count()
+
+df4 <- vibrio %>% 
+        group_by(Month) %>% 
+        count()
+
+df5 <- vibrio %>%
+        filter(Vp_Detect == 1) %>% 
+        count(gene) %>%
+        mutate(Percent = round(n / sum(n)*100, digits = 1))
+
+df4$Month <- factor(df4$Month, levels = c("1","2","3","4","5","6","7","8","9","10","11")) # change ordering manually
+
+counts.site = vibrio %>%
+                group_by(Year, Site) %>%count()
+counts.site = counts.site[order( counts.site$Year, counts.site$Site),]
+
+df2$Month <- factor(df2$Month, levels = c("1","2","3","4","5","6","7","8","9","10","11")) # change ordering manually
+
+ggplot(data = df, mapping = aes(x = Site, y = Percent, fill = Vp_Detect)) +
+  geom_bar(stat = "identity", position = "stack") +
+  # geom_text(mapping = aes(label = paste(Percent,"%", sep = ""), y = Percent)) +
+  scale_fill_manual(values = c("green3", "red")) +
+  labs(title = "Vibrio Detects by Site",
+       x = "Site",
+       y = "Percent")
+
+ggplot(data = df2, mapping = aes(x = Month, y = Percent, fill = Vp_Detect)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("green3", "red")) +
+  labs(title = "Vibrio Detects by Month",
+       x = "Month",
+       y = "Percent")
+
+ggplot(data = df3, mapping = aes(x = as.factor(Year), y = n)) +
+  geom_bar(stat = "identity", col = "2") +
+  scale_fill_manual(values = c("green", "red2")) +
+  labs(title = "Observations by Year",
+       x = "Year",
+       y = "Count")
+
+ggplot(data = df5, mapping = aes(x = gene, y = Percent)) +
+  geom_bar(stat = "identity", col = "2") +
+  scale_fill_manual(values = c("green", "red")) +
+  labs(title = "Pathogenic Gene Detection among Vp Detects",
+       x = "Gene",
+       y = "Percent")
+```
+
+```{r message=FALSE}
+
+ggplot() +
+  geom_point(data = vibrio %>% filter(vibrio$Vp_Detect == "0", vibrio$Vp_MPN_g_log != "NA"),
+            mapping = aes(x = Year, y = Vp_MPN_g_log), col = "green", position = "jitter") +
+  geom_smooth(data = vibrio %>% filter(vibrio$Vp_Detect == "0", vibrio$Vp_MPN_g_log != "NA"),
+            mapping = aes(x = Year, y = Vp_MPN_g_log), col = "darkgreen", se = FALSE) +
+  geom_point(data = vibrio %>% filter(vibrio$Vp_Detect == "1", vibrio$Vp_MPN_g_log != "NA"),
+            mapping = aes(x = Year, y = Vp_MPN_g_log), col = "red", position = "jitter") +
+  geom_smooth(data = vibrio %>% filter(vibrio$Vp_Detect == "1", vibrio$Vp_MPN_g_log != "NA"),
+            mapping = aes(x = Year, y = Vp_MPN_g_log), col = "darkred", se = FALSE) +
+  labs(title = "Vibrio Concentration By Year and Detection",
+       x = "Year", y = "Log Vp (MPN/g)")
+
+ggplot() +
+  geom_point(data = vibrio %>% filter(vibrio$Vp_Detect == "1", vibrio$Vp_MPN_g_log != "NA"),
+  mapping = aes(x = Year, y = Vp_MPN_g_log, col = trh), position = "jitter") +
+  labs(title = "trh Detection Frequency",
+  x = "Year", y = "Log Vp (MPN/g)")
+
+ggplot() +
+  geom_point(data = vibrio %>% filter(vibrio$Vp_Detect == "1", vibrio$Vp_MPN_g_log != "NA"),
+  mapping = aes(x = Year, y = Vp_MPN_g_log, col = tdh), position = "jitter") +
+  labs(title = "tdh Detection Frequency",
+  x = "Year", y = "Log Vp (MPN/g)")
+
+ggplot() +
+  geom_point(data = vibrio %>% filter(vibrio$Vp_Detect == "1", vibrio$Vp_MPN_g_log != "NA"),
+  mapping = aes(x = Year, y = Vp_MPN_g_log, col = gene), position = "jitter") +
+  scale_color_manual(values = c("Neither" = "green", "Both" = "red", "trh only" = "darkblue", "tdh only" = "orange")) +
+  labs(title = "Pathogenic Detection Frequency among Vp Detects",
+  x = "Year", y = "Log Vp (MPN/g)", col = "Pathogenic Gene")
+
+ggplot() +
+  geom_point(data = vibrio %>% filter(vibrio$Vp_Detect == "1", vibrio$Vp_MPN_g_log != "NA"),
+  mapping = aes(x = Year, y = Vp_MPN_g_log, col = gene), position = "jitter") +
+  scale_color_manual(values = c("Neither" = "green", "Both" = "red", "trh only" = "darkblue", "tdh only" = "orange")) +
+  labs(title = "Pathogenic Detection Frequency among Vp Detects",
+  x = "Year", y = "Log Vp (MPN/g)", col = "Pathogenic Gene")
+
+ggplot() +
+  geom_point(data = vibrio %>% filter(vibrio$Vp_Detect == "1", vibrio$Vp_MPN_g_log != "NA"),
+  mapping = aes(x = Year, y = Vp_MPN_g_log, col = gene2), position = "jitter") +
+  scale_color_manual(values = c("No" = "green", "Yes" = "red")) +
+  labs(title = "Pathogenic Detection Frequency among Vp Detects",
+  x = "Year", y = "Log Vp (MPN/g)", col = "Pathogenic Gene")
+```
+
+```{r}
+fig1 <- ggplot(data = vibrio %>%
+                 filter(Site == "Agua Hedionda")) +
+                geom_boxplot(mapping = aes(x = factor(Year), y = Vp_MPN_g_log, fill = factor(Year))) +
+                labs(title = "Agua Hedionda Vp Concentration by Year",
+                     x = "Year", y = "Log Vp (MPN/g)", fill = "Year")
+fig2 <- ggplot(data = vibrio %>%
+                 filter(Site == "Drakes Estero")) +
+                geom_boxplot(mapping = aes(x = factor(Year), y = Vp_MPN_g_log, fill = factor(Year))) +
+                labs(title = "Drakes Estero Vp Concentration by Year",
+                     x = "Year", y = "Log Vp (MPN/g)", fill = "Year")
+fig3 <- ggplot(data = vibrio %>%
+                 filter(Site == "Humboldt")) +
+                geom_boxplot(mapping = aes(x = factor(Year), y = Vp_MPN_g_log, fill = factor(Year))) +
+                labs(title = "Humboldt Vp Concentration by Year",
+                     x = "Year", y = "Log Vp (MPN/g)", fill = "Year")
+fig4 <- ggplot(data = vibrio %>%
+                 filter(Site == "Morro Bay")) +
+                geom_boxplot(mapping = aes(x = factor(Year), y = Vp_MPN_g_log, fill = factor(Year))) +
+                labs(title = "Morro Bay Vp Concentration by Year",
+                     x = "Year", y = "Log Vp (MPN/g)", fill = "Year")
+fig5 <- ggplot(data = vibrio %>%
+                 filter(Site == "Tomales Bay")) +
+                geom_boxplot(mapping = aes(x = factor(Year), y = Vp_MPN_g_log, fill = factor(Year))) +
+                labs(title = "Tomales Bay Vp Concentration by Year",
+                     x = "Year", y = "Log Vp (MPN/g)", fill = "Year")
+
+fig6 <- ggplot(data = vibrio) +
+                geom_boxplot(mapping = aes(x = factor(Year), y = Vp_MPN_g_log, fill = factor(Year))) +
+                labs(title = "Vp Concentration by Year",
+                     x = "Year", y = "Log Vp (MPN/g)", fill = "Year")
+
+fig1
+fig2
+fig3
+fig4
+fig5
+fig6
+
+# ggarrange(fig1, fig2, fig3, fig4, fig5, nrow = 3, ncol = 2)
+```
+
+
+```{r}
+ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA" & Site == "Agua Hedionda")) +
+    geom_boxplot(mapping = aes(x = factor(Year), y = sea_water_temperature, fill = factor(Year))) +
+    labs(title = "Agua Hedionda Temperature by Year", x = "Year", y = "Temperature (Celcius)", fill = "Year")
+
+ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA" & Site == "Drakes Estero")) +
+    geom_boxplot(mapping = aes(x = factor(Year), y = sea_water_temperature, fill = factor(Year))) +
+    labs(title = "Drakes Estero Temperature by Year", x = "Year", y = "Temperature (Celcius)", fill = "Year")
+
+ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA" & Site == "Humboldt")) +
+    geom_boxplot(mapping = aes(x = factor(Year), y = sea_water_temperature, fill = factor(Year))) +
+    labs(title = "Humboldt Temperature by Year", x = "Year", y = "Temperature (Celcius)", fill = "Year")
+
+ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA" & Site == "Morro Bay")) +
+    geom_boxplot(mapping = aes(x = factor(Year), y = sea_water_temperature, fill = factor(Year))) +
+    labs(title = "Morro Bay Temperature by Year", x = "Year", y = "Temperature (Celcius)", fill = "Year")
+
+ggplot(data = vibrio %>% filter(vibrio$sea_water_temperature != "NA" & Site == "Tomales Bay")) +
+    geom_boxplot(mapping = aes(x = factor(Year), y = sea_water_temperature, fill = factor(Year))) +
+    labs(title = "Tomales Bay Temperature by Year", x = "Year", y = "Temperature (Celcius)", fill = "Year")
+```
+
+
+
+
+
+
+
+
